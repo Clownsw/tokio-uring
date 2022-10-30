@@ -39,6 +39,8 @@ mod write;
 
 mod writev;
 
+use crate::driver::op::Lifecycle;
+use io_uring::opcode::AsyncCancel;
 use io_uring::IoUring;
 use slab::Slab;
 use std::io;
@@ -107,9 +109,10 @@ impl Driver {
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
                     self.tick();
                 }
-                Err(e) => {
+                Err(e) if e.raw_os_error() != Some(libc::EINTR) => {
                     return Err(e);
                 }
+                _ => continue,
             }
         }
     }
@@ -123,6 +126,34 @@ impl AsRawFd for Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        // get all ops in flight for cancellation
+        while !self.uring.submission().is_empty() {
+            self.submit().expect("Internal error when dropping driver");
+        }
+
+        // pre-determine what to cancel
+        let mut cancellable_ops = Vec::new();
+        for (id, cycle) in self.ops.lifecycle.iter() {
+            // don't cancel completed items
+            if !matches!(cycle, Lifecycle::Completed(_)) {
+                cancellable_ops.push(id);
+            }
+        }
+
+        // cancel all ops
+        for id in cancellable_ops {
+            unsafe {
+                while self
+                    .uring
+                    .submission()
+                    .push(&AsyncCancel::new(id as u64).build().user_data(u64::MAX))
+                    .is_err()
+                {
+                    self.submit().expect("Internal error when dropping driver");
+                }
+            }
+        }
+
         while self.num_operations() > 0 {
             // If waiting fails, ignore the error. The wait will be attempted
             // again on the next loop.
